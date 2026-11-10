@@ -1,0 +1,74 @@
+pipeline {
+  agent any
+  options { timestamps(); disableConcurrentBuilds() }
+  environment {
+    AWS_REGION = 'ap-southeast-2'
+    TF_IN_AUTOMATION = 'true'
+    TF_INPUT = 'false'
+  }
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+    stage('Terraform validate') {
+      steps {
+        dir('terraform') {
+          sh 'terraform fmt -check -recursive'
+          sh 'terraform init -input=false'
+          sh 'terraform validate'
+        }
+      }
+    }
+    stage('Provision AWS infrastructure') {
+      steps {
+        withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
+          dir('terraform') {
+            sh 'terraform plan -input=false -out=tfplan'
+            sh 'terraform apply -input=false -auto-approve tfplan'
+            sh 'terraform output -raw ecr_repository_url > ../ecr_repository_url.txt'
+          }
+        }
+      }
+    }
+    stage('Configure EKS and install platform') {
+      steps {
+        withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
+          withCredentials([string(credentialsId: 'github-repo-token', variable: 'GITHUB_TOKEN')]) {
+            sh '''
+              set -eu
+              aws eks update-kubeconfig --region ${AWS_REGION} --name job-preparation-eks
+              kubectl wait --for=condition=Ready nodes --all --timeout=15m
+
+              helm repo add argo https://argoproj.github.io/argo-helm
+              helm repo add eks https://aws.github.io/eks-charts
+              helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+              helm repo update
+
+              helm upgrade --install argocd argo/argo-cd --namespace argocd --create-namespace --wait --timeout 15m
+
+              ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+              VPC_ID=$(aws eks describe-cluster --name job-preparation-eks --region ${AWS_REGION} --query 'cluster.resourcesVpcConfig.vpcId' --output text)
+
+              helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller                 --namespace kube-system                 --set clusterName=job-preparation-eks                 --set region=${AWS_REGION}                 --set vpcId=${VPC_ID}                 --set serviceAccount.create=true                 --set serviceAccount.name=aws-load-balancer-controller                 --set serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::${ACCOUNT_ID}:role/job-preparation-aws-load-balancer-controller                 --wait --timeout 10m
+
+              helm upgrade --install monitoring prometheus-community/kube-prometheus-stack                 --namespace monitoring --create-namespace                 --set grafana.service.type=ClusterIP                 --set prometheus.prometheusSpec.retention=7d                 --wait --timeout 15m
+
+              kubectl create secret generic github-repo                 --namespace argocd                 --from-literal=type=git                 --from-literal=url=https://github.com/Arun230296new/job-preparation-app.git                 --from-literal=username=Arun230296new                 --from-literal=password="$GITHUB_TOKEN"                 --dry-run=client -o yaml | kubectl apply -f -
+
+              ECR_URL=$(cat ecr_repository_url.txt)
+              sed "s|REPLACE_WITH_ECR_REPOSITORY_URL|${ECR_URL}|g" argocd/application.yaml | kubectl apply -f -
+              kubectl get nodes
+              kubectl get pods -n argocd
+              kubectl get pods -n monitoring
+              kubectl get pods -n kube-system
+            '''
+          }
+        }
+      }
+    }
+  }
+  post {
+    success { echo 'Infrastructure pipeline completed successfully.' }
+    failure { echo 'Infrastructure pipeline failed. Review the stage logs before retrying.' }
+  }
+}
