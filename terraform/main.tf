@@ -70,6 +70,8 @@ module "eks" {
       max_size       = 3
       desired_size   = 2
       capacity_type  = "ON_DEMAND"
+      iam_role_name  = "job-preparation-workers"
+      iam_role_use_name_prefix = false
     }
   }
 
