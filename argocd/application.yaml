@@ -7,7 +7,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/Arun230296new/job-preparation-app.git
-    targetRevision: main
+    targetRevision: gitops
     path: helm/job-preparation
     helm:
       valueFiles:
